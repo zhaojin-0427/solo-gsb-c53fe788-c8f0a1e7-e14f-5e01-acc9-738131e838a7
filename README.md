@@ -432,7 +432,46 @@ curl -s localhost:8000/api/v1/payloads/status | python3 -m json.tool
 $ curl -s localhost:8000/api/v1/payloads/status | python3 -m json.tool
 ```
 
-响应（字段均为实际返回；对象存储后端为 MinIO 时 `store_mode="s3"`、
+**读一致性（迁移状态读竞态修复）**：接口的全部计数与迁移状态行都在**同一个
+`REPEATABLE READ` 只读事务（单一数据库快照）**内读取，且状态行与剩余数由
+**同一条 SQL**（状态行 + `COUNT(*) WHERE payload_digest IS NULL` 标量子查询）
+返回。因此最后一批旧 JSONB 恰好于查询期间提交时，同次响应要么整体取提交前
+视图、要么整体取提交后视图：
+
+- `legacy_events_pending` 与 `migration.remaining` **永远相等**（不会再出现一个
+  是 1、另一个是 0 的跨快照拼接）；
+- 除持久化 `failed` 外：快照内仍有可见旧行（`remaining > 0`）必报 `running`，
+  清零必报 `completed`——不会再出现自相矛盾的 `running` 配 `remaining=0`；
+- 接口**纯只读**（事务显式 `READ ONLY`），不推进迁移、不改变任何状态；持久化
+  `failed` 与 `last_error` 原样保留，重跑 `migrate` 成功后才清回。
+
+迁移进行中的响应（剩余 7，两个剩余数相等、status=running）：
+
+```json
+{
+    "store_mode": "s3",
+    "bucket": "webhook-payloads",
+    "total_events": 128,
+    "legacy_events_pending": 7,
+    "payload_objects": 30,
+    "total_references": 121,
+    "total_object_bytes": 4502,
+    "pending_submissions": 0,
+    "gc_candidates": 0,
+    "gc_grace_seconds": 3600,
+    "migration": {
+        "status": "running",
+        "processed": 121,
+        "remaining": 7,
+        "last_event_id": 121,
+        "last_error": null,
+        "updated_at": "2026-10-03T09:11:20.012944+00:00"
+    },
+    "gc_runs": []
+}
+```
+
+迁移完成后的响应（字段均为实际返回；对象存储后端为 MinIO 时 `store_mode="s3"`、
 `bucket="webhook-payloads"`，离线 `local` 后端 `bucket=null`）：
 
 ```json
@@ -471,15 +510,17 @@ $ curl -s localhost:8000/api/v1/payloads/status | python3 -m json.tool
 ```
 
 字段说明：`legacy_events_pending`/`migration.remaining` 为 0 即旧 JSONB 已全部
-挂上对象引用；`payload_objects` 是内容去重后的对象数，`total_references` 为
-引用总数（应等于已迁移/新格式事件数）；`migration.status` 为
+挂上对象引用；二者在同次响应中**必然相等**（同一 `REPEATABLE READ` 只读快照，
+见上“读一致性”）。`payload_objects` 是内容去重后的对象数，`total_references`
+为引用总数（应等于已迁移/新格式事件数）；`migration.status` 为
 `running/completed/failed`，对象上传失败的批次整批回滚时为 `failed` 且
 `last_error` 记录原因（剩余集合不变，重跑 `migrate` 即续跑并清回 `running`）。
-**`completed` 只在全库确无旧载荷（`remaining=0`）时写入**：并发下某个进程拿到
-空批或短批（剩余旧事件正被别的迁移进程 `SKIP LOCKED` 持锁，对端随后可能整批
-回滚）绝不会谎报完成；服务启动与每次 `migrate` 还会把“误标 `completed` 但仍有
-旧行”的陈旧状态自动重开为 `running` 并补迁。本接口只返回计数与状态，绝不返回
-载荷内容。
+**`completed` 只在全库确无旧载荷（`remaining=0`）时返回**：状态裁决纯只读地
+基于同一快照内的剩余事实（持久化 `failed` 优先保留），接口自身绝不写入
+completed，也不会在并发提交间隙谎报；并发下某个进程拿到空批或短批（剩余旧
+事件正被别的迁移进程 `SKIP LOCKED` 持锁，对端随后可能整批回滚）绝不会谎报
+完成；服务启动与每次 `migrate` 还会把“误标 `completed` 但仍有旧行”的陈旧
+状态自动重开为 `running` 并补迁。本接口只返回计数与状态，绝不返回载荷内容。
 
 迁移特性（与密钥迁移同一套“取批 `SKIP LOCKED` → 处理 → 提交”模式）：
 

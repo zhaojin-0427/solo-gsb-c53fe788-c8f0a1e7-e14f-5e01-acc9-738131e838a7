@@ -52,20 +52,26 @@ async def _status(verbose: bool) -> int:
     store = await init_object_store()
     try:
         async with pool.acquire() as conn:
-            total_events = await conn.fetchval("SELECT COUNT(*) FROM events")
-            legacy = await repo.count_legacy_events(conn)
-            objects = await repo.count_payload_objects(conn)
-            candidates = await repo.count_payload_candidates(conn)
-            gc_overview = await repo.gc_candidate_overview(conn)
-            pending = await repo.count_pending_submissions(conn)
-            migration = await payloads.migration_status(conn)
-            gc_runs = await repo.list_gc_runs(conn)
-            ref_sum = await conn.fetchval(
-                "SELECT COALESCE(SUM(ref_count), 0) FROM event_payload_objects"
-            )
-            bytes_sum = await conn.fetchval(
-                "SELECT COALESCE(SUM(size_bytes), 0) FROM event_payload_objects"
-            )
+            # 与 HTTP GET /payloads/status 同一读法：全部计数在单一
+            # REPEATABLE READ 只读快照内取得，legacy 剩余与 migration.remaining
+            # 必然相等且与 status 自洽；纯只读，不推进迁移/不改写任何状态。
+            async with conn.transaction(
+                isolation="repeatable_read", readonly=True
+            ):
+                total_events = await conn.fetchval("SELECT COUNT(*) FROM events")
+                legacy = await repo.count_legacy_events(conn)
+                objects = await repo.count_payload_objects(conn)
+                candidates = await repo.count_payload_candidates(conn)
+                gc_overview = await repo.gc_candidate_overview(conn)
+                pending = await repo.count_pending_submissions(conn)
+                migration = await payloads.migration_status(conn)
+                gc_runs = await repo.list_gc_runs(conn)
+                ref_sum = await conn.fetchval(
+                    "SELECT COALESCE(SUM(ref_count), 0) FROM event_payload_objects"
+                )
+                bytes_sum = await conn.fetchval(
+                    "SELECT COALESCE(SUM(size_bytes), 0) FROM event_payload_objects"
+                )
     finally:
         await close_pool()
 

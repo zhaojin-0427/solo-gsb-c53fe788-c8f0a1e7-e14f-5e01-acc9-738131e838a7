@@ -475,10 +475,34 @@ async def migrate_legacy_payloads(
 
 
 async def migration_status(conn: asyncpg.Connection) -> dict[str, Any]:
-    state = await repo.get_migration_state(conn)
-    remaining = await repo.count_legacy_events(conn)
+    """返回自洽的迁移状态快照（状态行 + remaining 同一数据库视图）。
+
+    读竞态修复：状态行与 COUNT(旧事件) 由
+    repo.get_migration_state_with_remaining 在**同一条语句**中读出（同一语句
+    快照），调用方（HTTP 接口 / CLI status）再把全部计数包在一个
+    REPEATABLE READ 只读事务里，故同次响应的 legacy_events_pending 与这里的
+    remaining 必然相等、且与 status 描述同一瞬间。
+
+    展示状态按同一快照内的事实裁决（**纯只读，不改写持久化状态**，迁移进度
+    只由 migrate 批次推进）：
+    - 持久化 failed：保留 failed 与 last_error（最近一批上传失败、整批已回滚，
+      重跑 migrate 成功批次会把状态清回 running/completed）；
+    - 其余情况：快照内仍有可见旧行（remaining>0）即 running，清零即 completed。
+      因此“running/0”“completed/剩余>0”这类跨快照拼接的自相矛盾结果不可能
+      出现；迁移者在同一事务内同时写 completed 与清零，本快照也只会看到二者
+      一致的一侧（提交前 running/>0，提交后 completed/0）。
+    """
+    state = await repo.get_migration_state_with_remaining(conn)
+    remaining = int(state["remaining"])
+    persisted_status = state["status"]
+    if persisted_status == "failed":
+        status = "failed"
+    elif remaining > 0:
+        status = "running"
+    else:
+        status = "completed"
     return {
-        "status": state["status"],
+        "status": status,
         "processed": state["processed"],
         "last_event_id": state["last_event_id"],
         "remaining": remaining,

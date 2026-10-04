@@ -22,6 +22,10 @@ completed，且单调 id 游标（id > last_event_id 领取）越过回滚行，
 5. 空批/短批裁决（case5）：并发下空批/短批绝不谎报 completed；失败批次
    释放后重跑必须迁完较早事件；仅在确无旧载荷时才 completed；重复运行不
    重复计数/不新增引用；旧库残留的“completed 但仍有旧行”状态会被重开。
+6. 状态读竞态（case6）：GET /api/v1/payloads/status 整段读在单一
+   REPEATABLE READ 只读快照内、状态行与 remaining 同语句读出；并发批次
+   提交前后每次响应均自洽（两处剩余相等、failed 外有旧行即 running、
+   清零即 completed）；只读不改进度，failed/last_error 原样保留。
 
 非 Docker：自动拉起便携 PostgreSQL + 本地文件对象后端（PAYLOAD_STORE_MODE=local）。
 """
@@ -686,6 +690,154 @@ async def case5_short_empty_batch_not_completed_and_rollback_revisited(
           f"n={n_reopen} state={dict(state_reopen)} rc={extra_rc}")
 
 
+# -- case 6：GET /api/v1/payloads/status 迁移状态读竞态修复 -----------------------------
+
+
+async def _endpoint_style_status(conn) -> tuple[int, dict]:
+    """复刻 GET /api/v1/payloads/status 的读法：单一 REPEATABLE READ 只读快照内
+    依次读取 legacy 计数与 migration_status；返回 (legacy, migration)。"""
+    async with conn.transaction(isolation="repeatable_read", readonly=True):
+        legacy = await repo.count_legacy_events(conn)
+        migration = await payloads.migration_status(conn)
+        return legacy, migration
+
+
+async def case6_status_read_race_consistent_view(pool, inner_store) -> None:
+    """状态接口在并发迁移提交前后始终给出自洽视图（本文件关注的读竞态修复）。
+
+    旧缺陷：API 先 COUNT legacy，再经 payloads.migration_status 读状态行与
+    remaining（READ COMMITTED 下各取新快照）；最后一批旧 JSONB 在两组查询间
+    提交时，响应会跨快照拼接——legacy 与 remaining 不等，或 status=running
+    但 remaining=0。修复后：整段读在一个 REPEATABLE READ 只读事务内，状态行
+    与 remaining 又是同一条语句（同一快照）读出，任何并发提交下都自洽。
+    """
+    from app.objectstore import LocalObjectStore
+
+    async with pool.acquire() as seed:
+        await reset_migration_running(seed)
+        n_events = 40
+        ids = await seed_legacy_events(
+            seed, [{"z": i} for i in range(n_events)], source="migsr"
+        )
+
+    # 6.1 有可见旧行 + 持久化 running：status=running、两处剩余相等且 >0。
+    async with pool.acquire() as conn:
+        legacy, migration = await _endpoint_style_status(conn)
+    check("6 旧行可见时报 running 且两处剩余相等",
+          legacy == n_events and migration["remaining"] == n_events
+          and migration["status"] == "running",
+          f"legacy={legacy} migration={migration}")
+
+    # 6.2 纯只读：状态查询不得推进/改写迁移进度。
+    async with pool.acquire() as conn:
+        before = dict(await repo.get_migration_state(conn))
+    async with pool.acquire() as conn:
+        await _endpoint_style_status(conn)
+        await payloads.migration_status(conn)
+    async with pool.acquire() as conn:
+        after = dict(await repo.get_migration_state(conn))
+    check("6 只读查询不改迁移进度/状态/时间戳",
+          before == after, f"before={before} after={after}")
+
+    # 6.3 读竞态压力：迁移分批提交的同时，多个连接高频以“接口同款读法”轮询；
+    # 每次响应都必须自洽——legacy==remaining，且
+    # failed 之外 remaining>0 必 running、remaining==0 必 completed。
+    store = HookLocalStore(LocalObjectStore(inner_store._root))
+    stop = asyncio.Event()
+    bad: list[str] = []
+    seen = {"running_gt0": 0, "completed_0": 0}
+
+    async def reader(name: str) -> None:
+        async with pool.acquire() as conn:
+            while not stop.is_set():
+                try:
+                    legacy, m = await _endpoint_style_status(conn)
+                except Exception as exc:  # noqa: BLE001
+                    bad.append(f"{name}: read error {exc!r}")
+                    return
+                if legacy != m["remaining"]:
+                    bad.append(
+                        f"{name}: legacy={legacy} != remaining={m['remaining']}"
+                    )
+                if m["status"] == "failed":
+                    pass  # 本轮无失败注入；若出现也保留 failed（契约允许）
+                elif m["remaining"] > 0 and m["status"] != "running":
+                    bad.append(f"{name}: remaining>0 但 status={m['status']}")
+                elif m["remaining"] == 0 and m["status"] != "completed":
+                    bad.append(f"{name}: remaining=0 但 status={m['status']}")
+                elif m["remaining"] > 0:
+                    seen["running_gt0"] += 1
+                else:
+                    seen["completed_0"] += 1
+                await asyncio.sleep(0)
+
+    async def migrator() -> None:
+        async with pool.acquire() as conn:
+            while True:
+                n = await payloads.migrate_legacy_payloads(
+                    conn, store, batch_size=3
+                )
+                if n == 0:
+                    return
+                await asyncio.sleep(0)  # 让批次间提交与读取交错
+
+    readers = [asyncio.create_task(reader(f"r{i}")) for i in range(4)]
+    mig = asyncio.create_task(migrator())
+    await mig
+    stop.set()
+    await asyncio.gather(*readers)
+    check("6 并发提交期间每次状态响应都自洽（无不等剩余/running-0/completed->0）",
+          not bad, "; ".join(bad[:5]))
+    check("6 并发期间两种自洽视图都被实际观察到（进行中 + 完成后）",
+          seen["running_gt0"] > 0 and seen["completed_0"] > 0, str(seen))
+
+    # 6.4 清零后：completed/0/两处相等；单语句读法本身（不包 RR 事务）也自洽。
+    async with pool.acquire() as conn:
+        legacy, migration = await _endpoint_style_status(conn)
+        raw = await payloads.migration_status(conn)
+    check("6 清零后 completed 且两处剩余均为 0",
+          legacy == 0 and migration["remaining"] == 0
+          and migration["status"] == "completed"
+          and raw["remaining"] == 0 and raw["status"] == "completed",
+          f"legacy={legacy} m={migration} raw={raw}")
+
+    # 6.5 failed 持久化必须保留（last_error 也保留），即便仍有旧行。
+    from app.objectstore import ObjectStoreError
+
+    fail_payloads = [{"sr-fail": i} for i in range(2)]
+    fail_digests = [canon(p)[0] for p in fail_payloads]
+    async with pool.acquire() as seed:
+        await reset_migration_running(seed)
+        fail_ids = await seed_legacy_events(
+            seed, fail_payloads, source="migsrf"
+        )
+    fstore = HookLocalStore(LocalObjectStore(inner_store._root))
+    fstore.fail_put = set(fail_digests)
+    async with pool.acquire() as conn:
+        raised = None
+        try:
+            await payloads.migrate_legacy_payloads(conn, fstore, batch_size=10)
+        except ObjectStoreError as exc:
+            raised = exc
+    check("6 注入失败批次抛出（前置条件）", isinstance(raised, ObjectStoreError))
+    async with pool.acquire() as conn:
+        legacy, m = await _endpoint_style_status(conn)
+    check("6 持久化 failed 与 last_error 原样保留（不被只读裁决改写）",
+          m["status"] == "failed" and m["last_error"]
+          and legacy == len(fail_ids) and m["remaining"] == len(fail_ids),
+          f"legacy={legacy} m={dict(m)}")
+
+    # 6.6 恢复后重跑：failed 清为 completed、剩余归零、两处相等（前后均自洽）。
+    fstore.fail_put = set()
+    async with pool.acquire() as conn:
+        n1 = await payloads.migrate_legacy_payloads(conn, fstore, batch_size=10)
+        legacy, m = await _endpoint_style_status(conn)
+    check("6 重跑成功后 failed 被清回 completed、剩余归零且两处相等",
+          n1 == len(fail_ids) and legacy == 0 and m["remaining"] == 0
+          and m["status"] == "completed" and m["last_error"] is None,
+          f"n1={n1} legacy={legacy} m={dict(m)}")
+
+
 def main() -> int:
     pg_root = tempfile.mkdtemp(prefix=".mig-pgdata-", dir=str(ROOT))
     obj_dir = tempfile.mkdtemp(prefix=".mig-store-", dir=str(ROOT))
@@ -726,6 +878,7 @@ async def _run() -> int:
         await case5_short_empty_batch_not_completed_and_rollback_revisited(
             pool, inner_store
         )
+        await case6_status_read_race_consistent_view(pool, inner_store)
     except Exception:  # noqa: BLE001
         import traceback
 

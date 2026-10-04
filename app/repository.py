@@ -1310,6 +1310,31 @@ async def get_migration_state(conn: asyncpg.Connection) -> asyncpg.Record:
     )
 
 
+async def get_migration_state_with_remaining(
+    conn: asyncpg.Connection,
+) -> asyncpg.Record:
+    """同一条语句读取迁移状态行与“实时剩余旧事件数”（同一快照）。
+
+    GET /api/v1/payloads/status 读竞态修复：READ COMMITTED 下每条语句各取快照，
+    若状态行与 COUNT(... payload_digest IS NULL) 分两条语句读取，最后一批迁移
+    恰好夹在两者之间提交时，就会得到自相矛盾的视图（running 配 remaining=0，
+    或 completed 配剩余>0）。单条 SELECT 中的标量子查询与主查询共享同一语句
+    快照（外层再包 REPEATABLE READ 只读事务时则与响应内其他计数共享同一快照，
+    见 api.payload_storage_status），保证行内 status 与 remaining 描述的是
+    同一个数据库瞬间。只读，绝不推进/改写迁移进度。
+    """
+    return await conn.fetchrow(
+        """
+        SELECT s.id, s.status, s.last_event_id, s.processed, s.last_error,
+               s.updated_at,
+               (SELECT COUNT(*) FROM events WHERE payload_digest IS NULL)
+                   AS remaining
+        FROM payload_migration_state s
+        WHERE s.id = 1
+        """
+    )
+
+
 async def update_migration_progress(
     conn: asyncpg.Connection, *, last_event_id: int, processed_delta: int
 ) -> None:

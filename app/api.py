@@ -576,23 +576,38 @@ async def crypto_status() -> CryptoStatusOut:
 
 @router.get("/payloads/status", response_model=PayloadStorageStatusOut, tags=["payloads"])
 async def payload_storage_status() -> PayloadStorageStatusOut:
-    """事件载荷对象存储 / 在线迁移 / GC 状态（只含计数，绝不含载荷内容）。"""
+    """事件载荷对象存储 / 在线迁移 / GC 状态（只含计数，绝不含载荷内容）。
+
+    所有计数与迁移状态行都在**同一个 REPEATABLE READ 只读事务**（单一数据库
+    快照）内读取：最后一批旧 JSONB 迁移在查询期间提交时，同次响应要么取提交
+    前视图（`legacy_events_pending == migration.remaining > 0` 且
+    `migration.status=running`），要么取提交后视图（两处剩余均为 0 且
+    completed），不会再跨快照拼接出“remaining 不一致”或“running/0”。本接口
+    纯只读，不推进迁移、不改变任何状态（failed/last_error 原样保留）。
+    """
     pool = get_pool()
     store = get_object_store()
     async with pool.acquire() as conn:
-        total_events = await conn.fetchval("SELECT COUNT(*) FROM events")
-        legacy = await repo.count_legacy_events(conn)
-        objects = await repo.count_payload_objects(conn)
-        candidates = await repo.count_payload_candidates(conn)
-        pending = await repo.count_pending_submissions(conn)
-        migration = await payloads.migration_status(conn)
-        gc_runs = await repo.list_gc_runs(conn)
-        ref_sum = await conn.fetchval(
-            "SELECT COALESCE(SUM(ref_count), 0) FROM event_payload_objects"
-        )
-        bytes_sum = await conn.fetchval(
-            "SELECT COALESCE(SUM(size_bytes), 0) FROM event_payload_objects"
-        )
+        # readonly=True：显式声明整段不做任何写入（也会阻止意外的写操作）；
+        # REPEATABLE READ：事务内全部语句共享同一快照，两个剩余数必然相等。
+        async with conn.transaction(
+            isolation="repeatable_read", readonly=True
+        ):
+            total_events = await conn.fetchval("SELECT COUNT(*) FROM events")
+            legacy = await repo.count_legacy_events(conn)
+            objects = await repo.count_payload_objects(conn)
+            candidates = await repo.count_payload_candidates(conn)
+            pending = await repo.count_pending_submissions(conn)
+            # 状态行与 remaining 由 migration_status 内部以单条语句读出；与
+            # legacy 计数同处一个事务快照，故 legacy == migration["remaining"]。
+            migration = await payloads.migration_status(conn)
+            gc_runs = await repo.list_gc_runs(conn)
+            ref_sum = await conn.fetchval(
+                "SELECT COALESCE(SUM(ref_count), 0) FROM event_payload_objects"
+            )
+            bytes_sum = await conn.fetchval(
+                "SELECT COALESCE(SUM(size_bytes), 0) FROM event_payload_objects"
+            )
     return PayloadStorageStatusOut(
         store_mode=store.mode,
         bucket=getattr(store, "bucket", None),
