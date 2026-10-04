@@ -11,6 +11,8 @@ __pycache__/
 .gc-store-*/
 .test-payloads/
 .test-payloads-crypto/
+.test-payloads-store/
+.test-slow-migrator.py
 .local-payloads/
 test-*.log
 stress-*.log

@@ -13,7 +13,10 @@
    恢复对象后重试成功（幂等/顺序/死信重放语义不变）；
 6. 垃圾回收：零引用对象经“标记 -> 宽限 -> 行锁复核”后删除；
    宽限期内/被重新引用的对象被复活不误删；--rescan-store 登记存储孤儿；
-7. payloadadmin status / API /api/v1/payloads/status 可观测。
+7. payloadadmin status / API /api/v1/payloads/status 可观测；迁移状态读一致性：
+   同次响应 legacy_events_pending == migration.remaining（同一只读快照），
+   除持久化 failed 外有旧行 running、清零 completed，只读不改进度；
+   慢迁移者并发提交期间反复采样无自相矛盾响应。
 
 非 Docker：自动拉起便携 PostgreSQL + 本地文件对象后端（PAYLOAD_STORE_MODE=local）。
 """
@@ -488,6 +491,170 @@ def main() -> int:
         h.admin("gc", "--rescan-store")
         h.admin("gc")
         check("存储孤儿过宽限后删除", not (PAYLOAD_DIR / orphan).exists())
+
+        # 6.5) GET /payloads/status 迁移状态读竞态修复：同次响应必须来自一致
+        # 的数据库视图（legacy_events_pending == migration.remaining），且
+        # 除持久化 failed 外，有可见旧行报 running、清零报 completed；只读不改进度。
+        async def seed_legacy_status(n, status):
+            """造 n 行旧 JSONB 事件（唯一键）并把迁移状态行置为 status。"""
+            conn = await _pg(h.dsn)
+            ts = time.time_ns()
+            for i in range(n):
+                await conn.execute(
+                    "INSERT INTO events (source,event_id,payload) "
+                    "VALUES ('statchk',$1,$2::jsonb)",
+                    f"e-{ts}-{i}", {"i": ts % 100000, "n": i},
+                )
+            await conn.execute(
+                "UPDATE payload_migration_state SET status=$1,"
+                "last_error=NULL, updated_at=now() WHERE id=1",
+                status,
+            )
+            await conn.close()
+
+        async def get_state_row():
+            conn = await _pg(h.dsn)
+            row = await conn.fetchrow(
+                "SELECT status, last_error, processed FROM payload_migration_state "
+                "WHERE id=1"
+            )
+            await conn.close()
+            return dict(row)
+
+        def assert_coherent(body, expect_status, expect_remaining):
+            mig = body["migration"]
+            return (
+                body["legacy_events_pending"] == expect_remaining
+                and mig["remaining"] == expect_remaining
+                and mig["status"] == expect_status
+            )
+
+        # (a) running/0：最后一批已提交、completed 尚未落库的瞬间 -> completed。
+        #     此刻全库无旧行（前面的迁移已完成），单独把状态行置 running 即可。
+        async def set_state(status, error=None):
+            conn = await _pg(h.dsn)
+            await conn.execute(
+                "UPDATE payload_migration_state SET status=$1,"
+                "last_error=$2, updated_at=now() WHERE id=1",
+                status, error,
+            )
+            await conn.close()
+
+        asyncio.run(set_state("running"))
+        body = api.get("/api/v1/payloads/status").json()
+        check("状态读一致：清零后报 completed（不出现 running/0）",
+              assert_coherent(body, "completed", 0),
+              json.dumps(body["migration"], ensure_ascii=False))
+
+        # (b) 持久化 failed 一律保留并带出 last_error，即使 remaining=0
+        asyncio.run(set_state("failed", "boom（一致性测试）"))
+        body = api.get("/api/v1/payloads/status").json()
+        check("状态读一致：remaining=0 时持久化 failed 仍保留",
+              body["migration"]["status"] == "failed"
+              and body["migration"]["remaining"] == 0
+              and body["legacy_events_pending"] == 0
+              and body["migration"]["last_error"] == "boom（一致性测试）",
+              json.dumps(body["migration"], ensure_ascii=False))
+        check("只读查询不清 failed/last_error",
+              asyncio.run(get_state_row())["status"] == "failed")
+
+        # (c) 有可见旧行 + 状态行 running -> running 且两个剩余数相等。
+        #     后续用例继续追加旧行，记录基线后按增量断言。
+        asyncio.run(seed_legacy_status(3, "running"))
+        body = api.get("/api/v1/payloads/status").json()
+        check("状态读一致：有旧行报 running 且两个剩余数相等(=3)",
+              assert_coherent(body, "running", 3),
+              json.dumps({"legacy": body["legacy_events_pending"],
+                          "migration": body["migration"]}, ensure_ascii=False))
+
+        # (d) 陈旧状态：状态行误标 completed 但仍有旧行 -> 读侧即报 running，
+        # 剩余数仍相等（不等持久化写入纠正，且只读查询不改状态行）。
+        asyncio.run(seed_legacy_status(2, "completed"))
+        before = asyncio.run(get_state_row())
+        body = api.get("/api/v1/payloads/status").json()
+        after = asyncio.run(get_state_row())
+        check("状态读一致：completed 但有旧行时报 running（不谎报完成）",
+              assert_coherent(body, "running", 5),
+              json.dumps({"legacy": body["legacy_events_pending"],
+                          "migration": body["migration"]}, ensure_ascii=False))
+        check("只读查询不改变迁移状态行（不重开/不推进）",
+              before["status"] == after["status"] == "completed"
+              and before["processed"] == after["processed"],
+              f"before={before} after={after}")
+
+        # (e) failed 且有旧行：failed 保留、两剩余数相等
+        asyncio.run(seed_legacy_status(2, "failed"))
+        body = api.get("/api/v1/payloads/status").json()
+        check("状态读一致：failed 且有旧行时 failed 保留、两个剩余数相等(=7)",
+              body["migration"]["status"] == "failed"
+              and assert_coherent(body, "failed", 7),
+              json.dumps({"legacy": body["legacy_events_pending"],
+                          "migration": body["migration"]}, ensure_ascii=False))
+
+        # (f) 并发：迁移批次持续提交期间反复查询，每次响应都必须自洽
+        #     （两剩余数相等；running 时 >0、completed 时 ==0；failed 保留）。
+        # 用后台子进程迁移，并把本地对象存储的 put 人为放慢，把“批次提交
+        # 正好落在 API 两次读取之间”的窗口放大，稳定复现旧实现的读竞态。
+        asyncio.run(seed_legacy_status(60, "running"))
+
+        env = os.environ.copy()
+        env.update(COMMON_ENV)
+        env["DATABASE_URL"] = h.dsn
+        # 预置一个“慢迁移者”脚本：每个对象上传前 sleep，放大批次提交窗口。
+        slow_script = ROOT / ".test-slow-migrator.py"
+        slow_script.write_text(
+            "import asyncio, sys\n"
+            "from app.objectstore import LocalObjectStore\n"
+            "_orig = LocalObjectStore.put_object\n"
+            "async def slow(self, digest, data):\n"
+            "    await asyncio.sleep(0.05)\n"
+            "    return await _orig(self, digest, data)\n"
+            "LocalObjectStore.put_object = slow\n"
+            "from app.payloadadmin import _migrate\n"
+            "sys.exit(asyncio.run(_migrate(5, 60.0)))\n",
+            encoding="utf-8",
+        )
+        migrator = subprocess.Popen(
+            [VENV_PY, str(slow_script)], cwd=ROOT, env=env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        try:
+            deadline = time.time() + 40
+            incoherent: list = []
+            probes = 0
+            while time.time() < deadline:
+                b = api.get("/api/v1/payloads/status").json()
+                probes += 1
+                m = b["migration"]
+                ok = b["legacy_events_pending"] == m["remaining"]
+                if m["status"] == "running":
+                    ok = ok and m["remaining"] > 0
+                elif m["status"] == "completed":
+                    ok = ok and m["remaining"] == 0
+                # failed 允许任意 remaining，但本场景不应出现
+                if not ok:
+                    incoherent.append({"legacy": b["legacy_events_pending"],
+                                       "migration": m})
+                if migrator.poll() is not None:
+                    break
+                time.sleep(0.01)
+            migrator.wait(timeout=20)
+        finally:
+            if migrator.poll() is None:
+                migrator.terminate()
+                migrator.wait(timeout=10)
+        check(f"并发迁移中每次状态响应自洽（采样 {probes} 次，无矛盾）",
+              migrator.returncode == 0 and not incoherent,
+              json.dumps({"rc": migrator.returncode,
+                          "bad": incoherent[:3]}, ensure_ascii=False))
+        # 收尾：把可能剩余的 statchk 旧行全部迁完，failed 状态由成功批次清回
+        out_final = h.admin("migrate")
+        body = api.get("/api/v1/payloads/status").json()
+        check("并发收尾后迁移完成、两剩余数为 0",
+              out_final.returncode == 0
+              and assert_coherent(body, "completed", 0),
+              json.dumps({"legacy": body["legacy_events_pending"],
+                          "migration": body["migration"]}, ensure_ascii=False))
 
         # 7) 状态可观测
         st = api.get("/api/v1/payloads/status")

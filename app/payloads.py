@@ -52,10 +52,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, AsyncIterator
 
 import asyncpg
 
@@ -475,10 +476,61 @@ async def migrate_legacy_payloads(
 
 
 async def migration_status(conn: asyncpg.Connection) -> dict[str, Any]:
-    state = await repo.get_migration_state(conn)
-    remaining = await repo.count_legacy_events(conn)
+    """迁移状态（独立快照读，供 CLI / 单调用方使用）。
+
+    状态行与剩余计数在同一个 read_only REPEATABLE READ 快照内读取，二者
+    必然对应同一数据库视图；状态再由该视图按 build_migration_status
+    规则裁决（failed 持久保留，有旧行 running，清零 completed）。
+    """
+    async with payload_status_snapshot(conn):
+        state = await repo.get_migration_state(conn)
+        remaining = await repo.count_legacy_events(conn)
+        return build_migration_status(state, remaining)
+
+
+@contextlib.asynccontextmanager
+async def payload_status_snapshot(
+    conn: asyncpg.Connection,
+) -> AsyncIterator[None]:
+    """状态查询的一致性只读快照（REPEATABLE READ READ ONLY）。
+
+    GET /payloads/status 的修复：旧实现把 COUNT 旧行与读 payload_migration_state
+    放在 READ COMMITTED 的不同语句里，每条语句各自取语句级快照——最后一批旧
+    JSONB 在两次查询之间提交时，响应可能同时给出 legacy_events_pending=0 而
+    migration.remaining>0（或反过来），甚至 status=running 而 remaining=0。
+
+    本上下文把同一次状态响应所需的全部读操作包进单个 REPEATABLE READ 只读
+    事务：事务内所有语句共享**同一个快照**，因此迁移状态行、剩余计数与各处
+    统计都来自一致的数据库视图，两个剩余数恒等、status 与 remaining 自洽。
+    READ ONLY 保证状态查询绝不写入、绝不推进迁移进度（并发提交前看到旧视图
+    报 running/N、提交后看到新视图报 completed/0，两种响应各自自洽）。
+    外层已有事务（如迁移批次内）则退化为保存点，不改变外层隔离级别。
+    """
+    async with conn.transaction(isolation="repeatable_read", readonly=True):
+        yield
+
+
+def build_migration_status(state: Any, remaining: int) -> dict[str, Any]:
+    """按同一快照内的持久化状态行与剩余计数裁决响应状态（纯函数，不触库）。
+
+    裁决规则（不写库，只影响本次响应；迁移命令如何落状态完全不变）：
+    - 持久化 `failed` 一律保留（哪怕 remaining=0，那是失败前已迁完的视图），
+      last_error 原样带出，由下次成功批次/重跑清回 running；
+    - 其余状态下以同快照的剩余集合为准：仍可见旧行（remaining>0）报
+      running；清零（remaining=0）报 completed。这样陈旧的 “completed 但
+      仍有旧行” 状态在被 reopen 持久化纠正之前，读侧也不会谎报完成；
+      而 running/0（最后一批刚提交、completed 尚未落库的瞬间）直接按
+      completed 呈现，与 remaining=0 自洽，不等待任何写入。
+    """
+    raw_status = state["status"]
+    if raw_status == "failed":
+        status = "failed"
+    elif remaining > 0:
+        status = "running"
+    else:
+        status = "completed"
     return {
-        "status": state["status"],
+        "status": status,
         "processed": state["processed"],
         "last_event_id": state["last_event_id"],
         "remaining": remaining,

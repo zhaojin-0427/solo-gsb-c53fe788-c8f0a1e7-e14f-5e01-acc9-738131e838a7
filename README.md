@@ -433,7 +433,36 @@ $ curl -s localhost:8000/api/v1/payloads/status | python3 -m json.tool
 ```
 
 响应（字段均为实际返回；对象存储后端为 MinIO 时 `store_mode="s3"`、
-`bucket="webhook-payloads"`，离线 `local` 后端 `bucket=null`）：
+`bucket="webhook-payloads"`，离线 `local` 后端 `bucket=null`）。
+
+迁移进行中（或最后一批刚提交的瞬间）看到的是 `running`，且两个剩余数
+**必然相等**——整次响应在同一个只读数据库快照内读取：
+
+```json
+{
+    "store_mode": "s3",
+    "bucket": "webhook-payloads",
+    "total_events": 128,
+    "legacy_events_pending": 17,
+    "payload_objects": 22,
+    "total_references": 111,
+    "total_object_bytes": 4207,
+    "pending_submissions": 0,
+    "gc_candidates": 0,
+    "gc_grace_seconds": 3600,
+    "migration": {
+        "status": "running",
+        "processed": 111,
+        "remaining": 17,
+        "last_event_id": 112,
+        "last_error": null,
+        "updated_at": "2026-10-03T09:11:58.842017+00:00"
+    },
+    "gc_runs": []
+}
+```
+
+迁移全部完成后：
 
 ```json
 {
@@ -475,11 +504,21 @@ $ curl -s localhost:8000/api/v1/payloads/status | python3 -m json.tool
 引用总数（应等于已迁移/新格式事件数）；`migration.status` 为
 `running/completed/failed`，对象上传失败的批次整批回滚时为 `failed` 且
 `last_error` 记录原因（剩余集合不变，重跑 `migrate` 即续跑并清回 `running`）。
+
+**状态读一致性（单次响应来自同一数据库视图）**：接口的状态行与全部计数
+（含 `legacy_events_pending` 与 `migration.remaining` 两处剩余数）在单个
+`REPEATABLE READ READ ONLY` 事务的同一快照内读取，因此同次响应中的两个剩余数
+恒等，绝不可能出现一个为 0、另一个非 0 的自相矛盾；接口纯只读，绝不推进或
+重开迁移。响应状态在该快照上即时裁决：除**持久化 `failed` 一律保留**（连同
+`last_error`）外，快照中仍可见旧行即报 `running`、清零即报 `completed`
+（所以最后一批恰在查询期间提交时，提交前的请求看到 `running/N`、提交后的
+请求看到 `completed/0`，二者各自自洽，不会出现 `running` 而 `remaining=0`）。
 **`completed` 只在全库确无旧载荷（`remaining=0`）时写入**：并发下某个进程拿到
 空批或短批（剩余旧事件正被别的迁移进程 `SKIP LOCKED` 持锁，对端随后可能整批
 回滚）绝不会谎报完成；服务启动与每次 `migrate` 还会把“误标 `completed` 但仍有
-旧行”的陈旧状态自动重开为 `running` 并补迁。本接口只返回计数与状态，绝不返回
-载荷内容。
+旧行”的陈旧状态自动重开为 `running` 并补迁（即便陈旧状态尚未被持久化纠正，
+只读状态接口也会按同快照剩余数直接呈现 `running`，不谎报完成）。本接口只返回
+计数与状态，绝不返回载荷内容。
 
 迁移特性（与密钥迁移同一套“取批 `SKIP LOCKED` → 处理 → 提交”模式）：
 
@@ -992,7 +1031,10 @@ python -m app.payloadadmin gc --rescan-store
   规范化键序归一、提交状态机崩溃恢复（补传对象、无悬空引用、不重复投递）、
   旧 JSONB 在线迁移与双读切换/clear-legacy、Worker 摘要校验
   （篡改对象 -> `payload_integrity`，恢复后重试成功）、GC 宽限/行锁复核/
-  复活保护与 `--rescan-store` 孤儿回收。
+  复活保护与 `--rescan-store` 孤儿回收；以及 `GET /payloads/status` 迁移状态
+  读一致性（同一快照下两个剩余数恒等、有旧行 running/清零 completed、持久化
+  failed 与 last_error 保留、只读不推进迁移、慢迁移者并发提交期间反复采样
+  无自相矛盾响应）。
 - `test_migrate_concurrency.py`：并发迁移专项——咨询锁按实际键统一顺序取齐
   且同键去重、两批 X/Y 事件顺序相反时确定性并发不死锁、多迁移者不同批次大小
   叠加 GC 压力下对象去重/引用计数/迁移进度精确且无悬空引用、上传失败整批

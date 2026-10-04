@@ -576,23 +576,35 @@ async def crypto_status() -> CryptoStatusOut:
 
 @router.get("/payloads/status", response_model=PayloadStorageStatusOut, tags=["payloads"])
 async def payload_storage_status() -> PayloadStorageStatusOut:
-    """事件载荷对象存储 / 在线迁移 / GC 状态（只含计数，绝不含载荷内容）。"""
+    """事件载荷对象存储 / 在线迁移 / GC 状态（只含计数，绝不含载荷内容）。
+
+    一致性读：状态行、legacy_events_pending 与 migration.remaining 等全部读
+    操作在**同一个只读 REPEATABLE READ 快照**内完成，因此同次响应对应同一
+    数据库视图——两个剩余数恒等；除持久化 failed 外，快照中仍可见旧行即
+    running、清零即 completed（见 payloads.build_migration_status）。本接口
+    只读，不会重开/推进迁移进度；最后一批旧载荷在查询间并发提交时，提交前
+    的请求看到 running/N、提交后的请求看到 completed/0，各自自洽。
+    """
     pool = get_pool()
     store = get_object_store()
     async with pool.acquire() as conn:
-        total_events = await conn.fetchval("SELECT COUNT(*) FROM events")
-        legacy = await repo.count_legacy_events(conn)
-        objects = await repo.count_payload_objects(conn)
-        candidates = await repo.count_payload_candidates(conn)
-        pending = await repo.count_pending_submissions(conn)
-        migration = await payloads.migration_status(conn)
-        gc_runs = await repo.list_gc_runs(conn)
-        ref_sum = await conn.fetchval(
-            "SELECT COALESCE(SUM(ref_count), 0) FROM event_payload_objects"
-        )
-        bytes_sum = await conn.fetchval(
-            "SELECT COALESCE(SUM(size_bytes), 0) FROM event_payload_objects"
-        )
+        async with payloads.payload_status_snapshot(conn):
+            total_events = await conn.fetchval("SELECT COUNT(*) FROM events")
+            # 剩余集合只 COUNT 这一次：外层字段与 migration.remaining 共用同一
+            # 快照下的同一个值，绝不可能出现两个不同的剩余数。
+            legacy = await repo.count_legacy_events(conn)
+            objects = await repo.count_payload_objects(conn)
+            candidates = await repo.count_payload_candidates(conn)
+            pending = await repo.count_pending_submissions(conn)
+            state = await repo.get_migration_state(conn)
+            migration = payloads.build_migration_status(state, legacy)
+            gc_runs = await repo.list_gc_runs(conn)
+            ref_sum = await conn.fetchval(
+                "SELECT COALESCE(SUM(ref_count), 0) FROM event_payload_objects"
+            )
+            bytes_sum = await conn.fetchval(
+                "SELECT COALESCE(SUM(size_bytes), 0) FROM event_payload_objects"
+            )
     return PayloadStorageStatusOut(
         store_mode=store.mode,
         bucket=getattr(store, "bucket", None),
